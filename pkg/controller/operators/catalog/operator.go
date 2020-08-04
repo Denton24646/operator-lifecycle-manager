@@ -861,7 +861,7 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 	// resolve a set of steps to apply to a cluster, a set of subscriptions to create/update, and any errors
 	steps, bundleLookups, updatedSubs, err := o.resolver.ResolveSteps(namespace, querier)
 	if err != nil {
-		go o.recorder.Event(ns, corev1.EventTypeWarning,"ResolutionFailed", err.Error())
+		go o.recorder.Event(ns, corev1.EventTypeWarning, "ResolutionFailed", err.Error())
 		return err
 	}
 
@@ -1578,9 +1578,9 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 		}
 
 		switch step.Status {
-		case v1alpha1.StepStatusPresent, v1alpha1.StepStatusCreated, v1alpha1.StepStatusWaitingForAPI:
+		case v1alpha1.StepStatusPresent, v1alpha1.StepStatusCreated:
 			continue
-		case v1alpha1.StepStatusUnknown, v1alpha1.StepStatusNotPresent:
+		case v1alpha1.StepStatusUnknown, v1alpha1.StepStatusNotPresent, v1alpha1.StepStatusWaitingForAPI:
 			manifest, err := r.ManifestForStep(step)
 			if err != nil {
 				return err
@@ -1857,11 +1857,15 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					return errorwrap.Wrapf(err, "error decoding %s object to an unstructured object", step.Resource.Name)
 				}
 
-				// Get the resource from the GVK.
+				// Get the GVK from the resource.
+				// Then check if the API for this dynamic resource is available on-cluster, before creating the resource, by querying discovery.
+				// This ensures CRs created via the dynamic client are created after the corresponding CRD is accepted and established on the cluster to avoid potential race conditions.
 				gvk := unstructuredObject.GroupVersionKind()
 				r, err := o.apiresourceFromGVK(gvk)
 				if err != nil {
-					return err
+					o.logger.Infof("failed to find any server resources for GVK %s in api discovery: %s", gvk.String(), err)
+					plan.Status.Plan[i].Status = v1alpha1.StepStatusWaitingForAPI
+					continue
 				}
 
 				// Create the GVR
@@ -2040,11 +2044,12 @@ func (o *Operator) apiresourceFromGVK(gvk schema.GroupVersionKind) (metav1.APIRe
 	}
 	for _, r := range resources.APIResources {
 		if r.Kind == gvk.Kind {
+			logger.WithField("kind", r.Kind).Infof("found GVK %s in api discovery", gvk.String())
 			return r, nil
 		}
 	}
 	logger.Info("couldn't find GVK in api discovery")
-	return metav1.APIResource{}, olmerrors.GroupVersionKindNotFoundError{gvk.Group, gvk.Version, gvk.Kind}
+	return metav1.APIResource{}, fmt.Errorf("could not find GVK %s in api discovery", gvk.String())
 }
 
 const (
