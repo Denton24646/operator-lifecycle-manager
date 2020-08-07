@@ -246,6 +246,61 @@ var _ = Describe("Installing bundles with new object types", func() {
 			}).Should(Succeed())
 		})
 	})
+
+	When("A bundle is installed with a CR that has no associated CRD", func() {
+		By("the API not becoming available on the api-server")
+		const (
+			packageName = "busybox"
+			channelName = "alpha"
+			subName     = "test-subscription"
+		)
+		var installPlanRef string
+
+		BeforeEach(func() {
+			const (
+				sourceName = "test-catalog"
+				imageName  = "quay.io/olmtest/single-bundle-index:missing-crd"
+			)
+			// create catalog source
+			source := &v1alpha1.CatalogSource{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       v1alpha1.CatalogSourceKind,
+					APIVersion: v1alpha1.CatalogSourceCRDAPIVersion,
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sourceName,
+					Namespace: testNamespace,
+					Labels:    map[string]string{"olm.catalogSource": sourceName},
+				},
+				Spec: v1alpha1.CatalogSourceSpec{
+					SourceType: v1alpha1.SourceTypeGrpc,
+					Image:      imageName,
+				},
+			}
+
+			source, err := operatorClient.OperatorsV1alpha1().CatalogSources(source.GetNamespace()).Create(context.TODO(), source, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred(), "could not create catalog source")
+
+			// Create a Subscription for package
+			_ = createSubscriptionForCatalog(operatorClient, source.GetNamespace(), subName, source.GetName(), packageName, channelName, "", v1alpha1.ApprovalAutomatic)
+
+			// Wait for the Subscription to succeed
+			sub, err := fetchSubscription(operatorClient, testNamespace, subName, subscriptionStateAtLatestChecker)
+			Expect(err).ToNot(HaveOccurred(), "could not get subscription at latest status")
+			installPlanRef = sub.Status.InstallPlanRef.Name
+
+		})
+
+		It("should fail the installplan after the timeout is exceeded", func() {
+			// Wait for the installplan to fail (2 minute timeout)
+			Eventually(func() error {
+				ip, err := fetchInstallPlan(GinkgoT(), operatorClient, installPlanRef, buildInstallPlanPhaseCheckFunc(v1alpha1.InstallPlanPhaseComplete, v1alpha1.InstallPlanPhaseFailed))
+				Expect(ip.Status.Conditions[0].Message).To(ContainSubstring("deadline exceeded"))
+				return err
+			}).Should(Succeed())
+			ctx.Ctx().Logf("install plan %s failed", installPlanRef)
+		})
+	})
 })
 
 func crdReady(status *apiextensionsv1beta1.CustomResourceDefinitionStatus) bool {

@@ -102,12 +102,13 @@ type Operator struct {
 	clientAttenuator         *scoped.ClientAttenuator
 	serviceAccountQuerier    *scoped.UserDefinedServiceAccountQuerier
 	bundleUnpacker           bundle.Unpacker
+	dynamicResourceTimeout   time.Duration
 }
 
 type CatalogSourceSyncFunc func(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *v1alpha1.CatalogSource, continueSync bool, syncError error)
 
 // NewOperator creates a new Catalog Operator.
-func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, utilImage string, operatorNamespace string) (*Operator, error) {
+func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, utilImage string, operatorNamespace string, dynamicResourceTimeout time.Duration) (*Operator, error) {
 	resyncPeriod := queueinformer.ResyncWithJitter(resync, 0.2)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
@@ -160,6 +161,7 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		catalogSubscriberIndexer: map[string]cache.Indexer{},
 		serviceAccountQuerier:    scoped.NewUserDefinedServiceAccountQuerier(logger, crClient),
 		clientAttenuator:         scoped.NewClientAttenuator(logger, config, opClient, crClient, dynamicClient),
+		dynamicResourceTimeout:   dynamicResourceTimeout,
 	}
 	op.sources = grpc.NewSourceStore(logger, 10*time.Second, 10*time.Minute, op.syncSourceState)
 	op.reconciler = reconciler.NewRegistryReconcilerFactory(lister, opClient, configmapRegistryImage, op.now)
@@ -1858,12 +1860,16 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 				}
 
 				// Get the GVK from the resource.
+				gvk := unstructuredObject.GroupVersionKind()
 				// Then check if the API for this dynamic resource is available on-cluster, before creating the resource, by querying discovery.
 				// This ensures CRs created via the dynamic client are created after the corresponding CRD is accepted and established on the cluster to avoid potential race conditions.
-				gvk := unstructuredObject.GroupVersionKind()
+				// (Default) 2 minute timeout for the required API to appear in discovery before failing the installplan
+				if timeout(plan.CreationTimestamp, o.dynamicResourceTimeout) {
+					return fmt.Errorf("required GVK %s not found via discovery: deadline exceeded", gvk.String())
+				}
 				r, err := o.apiresourceFromGVK(gvk)
 				if err != nil {
-					o.logger.Infof("failed to find any server resources for GVK %s in api discovery: %s", gvk.String(), err)
+					o.logger.Infof("failed to find required server resources: %s", err)
 					plan.Status.Plan[i].Status = v1alpha1.StepStatusWaitingForAPI
 					continue
 				}
@@ -2030,6 +2036,8 @@ func getCSVNameSet(plan *v1alpha1.InstallPlan) map[string]struct{} {
 	return csvNameSet
 }
 
+// apiresourceFromGVK looks for the presence of a GVK on the api-server in a non-blocking way.
+// It checks the installplan timestamp to determine whether or not to continue.
 func (o *Operator) apiresourceFromGVK(gvk schema.GroupVersionKind) (metav1.APIResource, error) {
 	logger := o.logger.WithFields(logrus.Fields{
 		"group":   gvk.Group,
@@ -2040,7 +2048,7 @@ func (o *Operator) apiresourceFromGVK(gvk schema.GroupVersionKind) (metav1.APIRe
 	resources, err := o.opClient.KubernetesInterface().Discovery().ServerResourcesForGroupVersion(gvk.GroupVersion().String())
 	if err != nil {
 		logger.WithField("err", err).Info("could not query for GVK in api discovery")
-		return metav1.APIResource{}, err
+		return metav1.APIResource{}, fmt.Errorf("could not query for GVK in api discovery: %s", err)
 	}
 	for _, r := range resources.APIResources {
 		if r.Kind == gvk.Kind {
@@ -2048,7 +2056,8 @@ func (o *Operator) apiresourceFromGVK(gvk schema.GroupVersionKind) (metav1.APIRe
 			return r, nil
 		}
 	}
-	logger.Info("couldn't find GVK in api discovery")
+
+	logger.Infof("could not find GVK %s in api discovery", gvk.String())
 	return metav1.APIResource{}, fmt.Errorf("could not find GVK %s in api discovery", gvk.String())
 }
 
@@ -2072,4 +2081,14 @@ var supportedKinds = map[string]struct{}{
 func isSupported(kind string) bool {
 	_, ok := supportedKinds[kind]
 	return ok
+}
+
+func timeout(timestamp metav1.Time, timeout time.Duration) bool {
+	if timestamp.IsZero() {
+		return false
+	}
+	if time.Now().Sub(timestamp.Time) > timeout {
+		return true
+	}
+	return false
 }
