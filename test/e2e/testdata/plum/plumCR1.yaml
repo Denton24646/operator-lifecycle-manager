@@ -1,0 +1,4 @@
+apiVersion: plumbus.operators.io/v1
+kind: Plum
+metadata:
+  name: my-plum
