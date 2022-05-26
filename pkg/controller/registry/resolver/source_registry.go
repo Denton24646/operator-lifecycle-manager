@@ -7,6 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
+
+	v1listers "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1"
+
 	"github.com/blang/semver/v4"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/cache"
@@ -301,4 +305,75 @@ func legacyDependenciesToProperties(dependencies []*api.Dependency) ([]*api.Prop
 		}
 	}
 	return result, nil
+}
+
+type OperatorGroupToggleSourceProvider struct {
+	sp              cache.SourceProviderWithInvalidate
+	logger          *logrus.Logger
+	ogLister        v1listers.OperatorGroupLister
+	globalNamespace string
+}
+
+func NewOperatorGroupToggleSourceProvider(sp cache.SourceProviderWithInvalidate, logger *logrus.Logger,
+	ogLister v1listers.OperatorGroupLister, globalNamespace string) *OperatorGroupToggleSourceProvider {
+	return &OperatorGroupToggleSourceProvider{
+		sp:              sp,
+		logger:          logger,
+		ogLister:        ogLister,
+		globalNamespace: globalNamespace,
+	}
+}
+
+const exclusionAnnotation string = "olm.operatorframework.io/exclude-global-namespace-resolution"
+
+func (e *OperatorGroupToggleSourceProvider) Sources(namespaces ...string) map[cache.SourceKey]cache.Source {
+	// Check if annotation is set first
+	resolutionNamespaces := e.CheckForExclusion(namespaces...)
+	return e.sp.Sources(resolutionNamespaces...)
+}
+
+func (e *OperatorGroupToggleSourceProvider) Invalidate(key cache.SourceKey) {
+	e.sp.Invalidate(key)
+}
+
+func (e *OperatorGroupToggleSourceProvider) CheckForExclusion(namespaces ...string) []string {
+	var defaultResult = namespaces
+	// The first namespace provided is always the current namespace being synced
+	var ownNamespace = namespaces[0]
+	var globalNamespace = e.globalNamespace
+	var toggledResult = []string{ownNamespace}
+
+	if ownNamespace == globalNamespace {
+		// Global namespace is being synced
+		// Return early with default
+		return defaultResult
+	}
+
+	// Check the OG on the NS provided for the exclusion annotation
+	ogs, err := e.ogLister.OperatorGroups(ownNamespace).List(labels.Everything())
+	if err != nil {
+		// Assume resolution was global in the case of an error (the default behavior)
+		return defaultResult
+	}
+
+	if len(ogs) != 1 || ogs[0] == nil {
+		// Problem with the operatorgroup configuration in the namespace
+		// The namespace may not be configured as an operator installation target namespace
+		// Assume global resolution (default)
+		return defaultResult
+	}
+
+	var og = ogs[0]
+	if og.Annotations == nil {
+		// No exclusion specified
+		return defaultResult
+	}
+	if val, ok := og.Annotations[exclusionAnnotation]; ok && val == "true" {
+		// Exclusion specified
+		// Ignore the globalNamespace for the purposes of resolution in this namespace
+		e.logger.Printf("excluding global catalogs from resolution in namespace %s", ownNamespace)
+		return toggledResult
+	}
+
+	return defaultResult
 }
