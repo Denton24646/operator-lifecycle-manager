@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/operator-framework/api/pkg/operators/reference"
+	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
@@ -260,7 +261,19 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 
 	operatorGroupInformer := crInformerFactory.Operators().V1().OperatorGroups()
 	op.lister.OperatorsV1().RegisterOperatorGroupLister(metav1.NamespaceAll, operatorGroupInformer.Lister())
-	if err := op.RegisterInformer(operatorGroupInformer.Informer()); err != nil {
+	ogQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ogs")
+	op.ogQueueSet.Set(metav1.NamespaceAll, ogQueue)
+	operatorGroupQueueInformer, err := queueinformer.NewQueueInformer(
+		ctx,
+		queueinformer.WithLogger(op.logger),
+		queueinformer.WithQueue(ogQueue),
+		queueinformer.WithInformer(operatorGroupInformer.Informer()),
+		queueinformer.WithSyncer(queueinformer.LegacySyncHandler(op.syncOperatorGroups).ToSyncer()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.RegisterQueueInformer(operatorGroupQueueInformer); err != nil {
 		return nil, err
 	}
 
@@ -1082,6 +1095,20 @@ func (o *Operator) syncSubscriptions(obj interface{}) error {
 	}
 
 	o.nsResolveQueue.Add(sub.GetNamespace())
+
+	return nil
+}
+
+// syncOperatorGroups requeues the namespace resolution queue on changes to an operatorgroup
+// This is because the operatorgroup is now an input to resolution via the global catalog exclusion annotation
+func (o *Operator) syncOperatorGroups(obj interface{}) error {
+	og, ok := obj.(*operatorsv1.OperatorGroup)
+	if !ok {
+		o.logger.Debugf("wrong type: %#v", obj)
+		return fmt.Errorf("casting OperatorGroup failed")
+	}
+
+	o.nsResolveQueue.Add(og.GetNamespace())
 
 	return nil
 }
