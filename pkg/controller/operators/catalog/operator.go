@@ -118,7 +118,7 @@ type Operator struct {
 	bundleUnpackTimeout      time.Duration
 	clientFactory            clients.Factory
 	muInstallPlan            sync.Mutex
-	resolverSourceProvider   resolvercache.SourceProviderWithInvalidate
+	resolverSourceProvider   SourceProviderWithInvalidate
 }
 
 type CatalogSourceSyncFunc func(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *v1alpha1.CatalogSource, continueSync bool, syncError error)
@@ -191,7 +191,7 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		clientFactory:            clients.NewFactory(config),
 	}
 	op.sources = grpc.NewSourceStore(logger, 10*time.Second, 10*time.Minute, op.syncSourceState)
-	op.resolverSourceProvider = resolver.NewOperatorGroupToggleSourceProvider(resolver.SourceProviderFromRegistryClientProvider(op.sources, logger),
+	op.resolverSourceProvider = NewOperatorGroupToggleSourceProvider(resolver.SourceProviderFromRegistryClientProvider(op.sources, logger),
 		logger, op.lister.OperatorsV1().OperatorGroupLister(), operatorNamespace)
 	op.reconciler = reconciler.NewRegistryReconcilerFactory(lister, opClient, configmapRegistryImage, op.now, ssaClient)
 	res := resolver.NewOperatorStepResolver(lister, crClient, operatorNamespace, op.resolverSourceProvider, logger)

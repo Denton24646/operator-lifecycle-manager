@@ -52,11 +52,6 @@ type SourceProvider interface {
 	Sources(namespaces ...string) map[SourceKey]Source
 }
 
-type SourceProviderWithInvalidate interface {
-	SourceProvider
-	Invalidate(key SourceKey)
-}
-
 type StaticSourceProvider map[SourceKey]Source
 
 func (p StaticSourceProvider) Sources(namespaces ...string) map[SourceKey]Source {
